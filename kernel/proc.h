@@ -104,4 +104,11 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  int trace_mask;              // Mask of syscalls to trace (syscall lab)
+  // Sandbox state (syscall lab).  Bit N of imask means "reject syscall N".
+  // ipath is the one pathname that a masked open() is still allowed to use.
+  // Both are inherited by children of fork, so a sandbox cannot be escaped
+  // by forking.
+  int imask;
+  char ipath[MAXPATH];
 };

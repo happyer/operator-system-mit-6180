@@ -287,6 +287,13 @@ kfork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
+  np->trace_mask = p->trace_mask;   // child inherits the trace mask
+
+  // The child inherits the parent's sandbox; otherwise a sandboxed
+  // process could escape simply by forking.
+  np->imask = p->imask;
+  memmove(np->ipath, p->ipath, MAXPATH);
+
   pid = np->pid;
 
   release(&np->lock);

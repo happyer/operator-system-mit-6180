@@ -101,6 +101,8 @@ extern uint64 sys_unlink(void);
 extern uint64 sys_link(void);
 extern uint64 sys_mkdir(void);
 extern uint64 sys_close(void);
+extern uint64 sys_trace(void);
+extern uint64 sys_interpose(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -126,7 +128,64 @@ static uint64 (*syscalls[])(void) = {
 [SYS_link]    sys_link,
 [SYS_mkdir]   sys_mkdir,
 [SYS_close]   sys_close,
+[SYS_trace]   sys_trace,
+[SYS_interpose] sys_interpose,
 };
+
+// Names of the system calls, indexed by system call number.
+// Used by the trace lab to print readable system call names.
+static char *syscall_names[] = {
+  [SYS_fork]    "fork",
+  [SYS_exit]    "exit",
+  [SYS_wait]    "wait",
+  [SYS_pipe]    "pipe",
+  [SYS_read]    "read",
+  [SYS_kill]    "kill",
+  [SYS_exec]    "exec",
+  [SYS_fstat]   "fstat",
+  [SYS_chdir]   "chdir",
+  [SYS_dup]     "dup",
+  [SYS_getpid]  "getpid",
+  [SYS_sbrk]    "sbrk",
+  [SYS_pause]   "pause",
+  [SYS_uptime]  "uptime",
+  [SYS_open]    "open",
+  [SYS_write]   "write",
+  [SYS_mknod]   "mknod",
+  [SYS_unlink]  "unlink",
+  [SYS_link]    "link",
+  [SYS_mkdir]   "mkdir",
+  [SYS_close]   "close",
+  [SYS_trace]   "trace",
+  [SYS_interpose] "interpose",
+};
+
+// Decide whether the sandbox installed by sys_interpose() rejects
+// syscall num.  Bit num of p->imask means "reject".  A masked open()
+// is still allowed when its pathname equals the process's allowed
+// pathname; every other masked syscall is rejected.
+//
+// Must only be called after syscall()'s bounds check, because
+// 1 << num is undefined behaviour unless 0 <= num < 32.
+static int
+interposed(struct proc *p, int num)
+{
+  char path[MAXPATH];
+
+  if((p->imask & (1 << num)) == 0)
+    return 0;                       // not masked: allowed
+
+  if(num == SYS_open){
+    // argstr() copies the pathname out of user space and validates the
+    // pointer for us, so a bogus argument just fails the comparison
+    // instead of crashing the kernel.
+    if(argstr(0, path, MAXPATH) >= 0 &&
+       strncmp(path, p->ipath, MAXPATH) == 0)
+      return 0;                     // masked, but on the allowed pathname
+  }
+
+  return 1;                         // rejected
+}
 
 void
 syscall(void)
@@ -136,9 +195,22 @@ syscall(void)
 
   num = p->trapframe->a7;
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+    // The sandbox check comes after the bounds check above (so that
+    // 1 << num is well defined) and before the call (so that a rejected
+    // syscall has no effect whatsoever).
+    if(interposed(p, num)){
+      p->trapframe->a0 = -1;
+      return;
+    }
     // Use num to lookup the system call function for num, call it,
     // and store its return value in p->trapframe->a0
     p->trapframe->a0 = syscalls[num]();
+    // if this system call's bit is set in p->trace_mask,
+    // print the call and its return value.
+    if(p->trace_mask & (1 << num)){
+      printf("%d: syscall %s -> %d\n",
+             p->pid, syscall_names[num], (int)p->trapframe->a0);
+    }
   } else {
     printf("%d %s: unknown sys call %d\n",
             p->pid, p->name, num);

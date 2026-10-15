@@ -23,6 +23,43 @@ sys_getpid(void)
 }
 
 uint64
+sys_trace(void)
+{
+  int mask;
+  argint(0, &mask);           // fetch the mask argument from the user
+  myproc()->trace_mask = mask;
+  return 0;
+}
+
+// Sandbox the calling process: bit N of mask means "reject syscall N",
+// and path is the one pathname a masked open() may still use.
+// The settings survive exec and are inherited by fork.
+uint64
+sys_interpose(void)
+{
+  int mask;
+  char path[MAXPATH];
+  struct proc *p = myproc();
+
+  argint(0, &mask);
+
+  // Clear first so that the tail of the buffer (beyond the string's nul)
+  // is deterministic rather than leftover kernel stack contents.
+  memset(path, 0, MAXPATH);
+
+  // argstr() copies the pathname out of user space.  A bogus user pointer
+  // fails here instead of crashing the kernel, and later comparisons
+  // never touch user memory.
+  if(argstr(1, path, MAXPATH) < 0)
+    return -1;
+
+  p->imask = mask;
+  memmove(p->ipath, path, MAXPATH);
+
+  return 0;
+}
+
+uint64
 sys_fork(void)
 {
   return kfork();
