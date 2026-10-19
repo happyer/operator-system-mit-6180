@@ -142,9 +142,31 @@ walkaddr(pagetable_t pagetable, uint64 va)
 
 
 #if defined(LAB_PGTBL) || defined(SOL_MMAP) || defined(SOL_COW)
+// Recursively print one subtree. level: 2=root entries, 0=leaves.
+// va_base: starting virtual address covered by this page-table page.
+static void
+vmprint_walk(pagetable_t pagetable, int level, uint64 va_base)
+{
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if((pte & PTE_V) == 0)
+      continue;
+    // reconstruct the va this PTE covers: parent base | index << shift
+    uint64 va = va_base | ((uint64)i << PXSHIFT(level));
+    // indent: depth 1/2/3 for level 2/1/0
+    for(int d = 0; d < 3 - level; d++)
+      printf(" ..");
+    printf("%p: pte %p pa %p\n", (void*)va, (void*)pte, (void*)PTE2PA(pte));
+    // intermediate node (V=1, R|W|X all zero): recurse into the child table
+    if(!PTE_LEAF(pte) && level > 0)
+      vmprint_walk((pagetable_t)PTE2PA(pte), level - 1, va);
+  }
+}
+
 void
 vmprint(pagetable_t pagetable) {
-  // your code here
+  printf("page table %p\n", pagetable);
+  vmprint_walk(pagetable, 2, 0);
 }
 #endif
 
