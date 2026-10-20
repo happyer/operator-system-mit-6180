@@ -1,0 +1,144 @@
+Answers to the pgtbl lab questions. All values below are from actual runs of
+pgtbltest on this machine (xv6-labs-2025, branch pgtbl).
+
+=====================================================================
+Q1. For every page table entry in the print_pgtbl output, explain what
+    it logically contains and what its permission bits are.
+=====================================================================
+
+Our observed output (perm bits: V=0x1 R=0x2 W=0x4 X=0x8 U=0x10 G=0x20 A=0x40 D=0x80):
+
+  va 0x0         pte 0x215DF85B pa 0x8577E000 perm 0x5B
+  va 0x1000      pte 0x215DEC5B pa 0x8577B000 perm 0x5B
+  va 0x2000      pte 0x215DE817 pa 0x8577A000 perm 0x17
+  va 0x3000      pte 0x215DE407 pa 0x85779000 perm 0x07
+  va 0x4000      pte 0x215DE0D7 pa 0x85778000 perm 0xD7
+  va 0x5000..0x9000            pte 0x0          perm 0x0
+  va 0x3FFFFF6000..0x3FFFFFC000 pte 0x0         perm 0x0
+  va 0x3FFFFFD000 pte 0x215EC413 pa 0x857B1000 perm 0x13
+  va 0x3FFFFFE000 pte 0x215E7CC7 pa 0x8579F000 perm 0xC7
+  va 0x3FFFFFF000 pte 0x2000184B pa 0x80006000 perm 0x4B
+
+- va 0x0 and 0x1000, perm 0x5B = V|R|X|U|A: the TEXT segment of pgtbltest
+  (user .ld links user programs at 0). Executable by user code; the Accessed
+  bit is set because the CPU has fetched instructions from these pages.
+
+- va 0x2000, perm 0x17 = V|R|W|U: the DATA segment (initialized data/bss).
+  Writable by the user, not executable. No A bit yet: nothing has read or
+  written it at the time print_pgtbl runs.
+
+- va 0x3000, perm 0x07 = V|R|W but NO U bit: the STACK GUARD PAGE. In the
+  2025 exec.c, the kernel allocates (USERSTACK+1) pages for the stack and
+  then calls uvmclear() on the lowest one, which clears PTE_U. Any attempt
+  by user code to touch it (e.g. a runaway stack) triggers a page fault in
+  usertrap() and kills the process, instead of silently corrupting data.
+  The kernel could still write it (no-U pages are kernel-accessible).
+
+- va 0x4000, perm 0xD7 = V|R|W|U|A|D: the USER STACK page. Both Accessed
+  and Dirty are set because exec() used copyout() to write the argument
+  strings ("pgtbltest") and the argv[] array onto this page.
+
+- va 0x5000..0x9000, pte 0: unmapped hole. This is where the heap would
+  grow via sbrk(); pgtbltest has not grown it yet at this point.
+
+- va 0x3FFFFF6000..0x3FFFFFC000, pte 0: unmapped gap just below the three
+  special pages at the very top of the user address space.
+
+- va 0x3FFFFFD000, perm 0x13 = V|R|U (read-only for user, NO W): the
+  USYSCALL page added by this lab. It holds struct usyscall { int pid; },
+  letting ugetpid() read the pid with a plain load instead of a trap.
+  Read-only so a process cannot fake its pid. No A bit yet because
+  print_pgtbl runs before ugetpid_test touches it (after ugetpid_test,
+  the pte shows 0x53 = A bit set by hardware).
+
+- va 0x3FFFFFE000, perm 0xC7 = V|R|W|A|D, and notably NO U bit: the
+  TRAPFRAME page. uservec/userret in trampoline.S save/restore the 32
+  registers here, but they run in S-mode (after the trap), so PTE_U is
+  not needed; user code itself never touches this page. A and D are set
+  because every system call writes it (print_pgtbl itself used the pgpte
+  syscall before dumping these lines).
+
+- va 0x3FFFFFF000, perm 0x4B = V|R|X|A, no U, no W: the TRAMPOLINE page,
+  the highest user VA (MAXVA - PGSIZE). pa = 0x80006000 lies inside the
+  kernel's own text: every process maps the SAME physical trampoline page
+  (shared, executable, read-only) so the trap entry/exit code remains
+  reachable at the same VA across the satp switch. A is set because ecall
+  has executed through it.
+
+Also note: virtual pages are NOT consecutive in physical memory
+(0x8577E000, 0x8577B000, 0x8577A000, ... are scattered) because each
+page came from a separate kalloc() off the free list.
+
+=====================================================================
+Q2. Which other xv6 system call(s) could be made faster using this
+    shared page? Explain how.
+=====================================================================
+
+The trick works for any syscall whose ENTIRE job is to hand user space a
+small piece of kernel-maintained state that changes rarely. Candidates:
+
+- sbrk(0) (query the current break without moving it): the kernel could
+  keep a "sz" field in struct usyscall, updated inside growproc() whenever
+  p->sz changes; user code reads usyscall->sz directly. Only sbrk(n) with
+  n != 0 still needs the real syscall, since it has a side effect.
+
+- Conceptually, small per-process identities like a future getppid() or
+  a cached errno (glibc does exactly this: errno lives in user memory).
+
+- Global read-mostly values (uptime, time of day) could go on a GLOBAL
+  shared read-only page updated periodically by the kernel — this is what
+  Linux's vDSO does for clock_gettime()/gettimeofday(): the kernel
+  publishes timekeeping state and user space computes the time without
+  a single trap.
+
+Calls that CANNOT be accelerated this way: anything with side effects or
+needing kernel arbitration — fork, exit, read, write, wait, sbrk(n!=0).
+The shared page is mapped read-only (PTE_U without PTE_W), so user space
+can consume the values but can never forge them; the kernel remains the
+single writer, which is what makes the optimization safe.
+
+=====================================================================
+Q3. For every leaf page in the vmprint output, explain what it logically
+    contains, its permission bits, and how it relates to print_pgtbl.
+=====================================================================
+
+Our vmprint output (kpgtbl() on pgtbltest) prints the tree:
+
+  page table 0x0000000087f22000
+   ..0x0000000000000000: pte ...801 pa 0x87f1e000        (L1 table for va 0 region)
+   .. ..0x0000000000000000: pte ...401 pa 0x87f1d000      (L0 table for first 2MB)
+   .. .. ..0x0000000000000000: pte 0x21fc7c5b pa 0x87f1f000   text
+   .. .. ..0x0000000000001000: pte 0x21fc705b pa 0x87f1c000   text
+   .. .. ..0x0000000000002000: pte 0x21fc6cd7 pa 0x87f1b000   data
+   .. .. ..0x0000000000003000: pte 0x21fc6807 pa 0x87f1a000   stack guard
+   .. .. ..0x0000000000004000: pte 0x21fc64d7 pa 0x87f19000   stack
+   ..0x0000003fc0000000: pte ...401 pa 0x87f21000         (L1 table for top region)
+   .. ..0x0000003fffe00000: pte ...001 pa 0x87f20000      (L0 table for last 2MB)
+   .. .. ..0x0000003fffffd000: pte ...853 pa 0x87f52000   USYSCALL
+   .. .. ..0x0000003fffffe000: pte ...0c7 pa 0x87f40000   TRAPFRAME
+   .. .. ..0x0000003ffffff000: pte ...84b pa 0x80007000   TRAMPOLINE
+
+The 8 leaves, bottom to top:
+
+- 0x0, 0x1000 (0x5b = V|R|X|U|A): text segment of pgtbltest.
+- 0x2000 (0xd7/0x17): data segment (writable user data).
+- 0x3000 (0x07 = V|R|W, no U): stack guard page (see Q1).
+- 0x4000 (0xd7 = V|R|W|U|A|D): user stack with argv strings.
+- 0x3fffffd000 (0x53 = V|R|U|A): USYSCALL page; the A bit shows ugetpid
+  has read it by the time kpgtbl() runs (ugetpid_test ran first).
+- 0x3fffffe000 (0xc7 = V|R|W|A|D): TRAPFRAME, written on every trap.
+- 0x3ffffff000 (0x4b = V|R|X|A): TRAMPOLINE; its pa (0x80007000) is the
+  only one inside kernel text — the physical page shared by ALL processes
+  and by the kernel page table itself.
+
+Relation to print_pgtbl: both describe the SAME page table of the SAME
+process, and every leaf line of vmprint matches a line of print_pgtbl
+with identical va/pte/pa/flags (up to A/D bits advancing as the test
+runs). The difference is the viewpoint: print_pgtbl probes selected
+virtual addresses one at a time through the pgpte syscall (a user-visible
+"what is at this va?" query), while vmprint dumps the whole tree from the
+kernel side, additionally revealing the INTERIOR structure — the two
+intermediate page-table pages (pte ending in ...801/...401/...001, i.e.
+V=1 with R|W|X=0) and the physical addresses of the page-table pages
+themselves, which pgpte can never show because it only answers for
+leaf mappings.
