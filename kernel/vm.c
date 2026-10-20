@@ -137,6 +137,13 @@ walkaddr(pagetable_t pagetable, uint64 va)
   if((*pte & PTE_U) == 0)
     return 0;
   pa = PTE2PA(*pte);
+#ifdef LAB_PGTBL
+  if(is_super(pa)){
+    // walk returned a level-1 megapage leaf: like the hardware, the
+    // low 21 bits of the translation come from va, not from the PTE.
+    pa = (pa & ~(SUPERPGSIZE-1)) | (va & (SUPERPGSIZE-1));
+  }
+#endif
   return pa;
 }
 
@@ -172,6 +179,30 @@ vmprint(pagetable_t pagetable) {
 
 
 
+// Like walk, but stops at level 1: returns the address of the L1 PTE
+// (the slot holding either a pointer to an L0 table or a megapage leaf).
+#ifdef LAB_PGTBL
+static pte_t *
+walkl1(pagetable_t pagetable, uint64 va, int alloc)
+{
+  pte_t *pte;
+
+  if(va >= MAXVA)
+    panic("walkl1");
+
+  pte = &pagetable[PX(2, va)];
+  if(*pte & PTE_V){
+    pagetable = (pagetable_t)PTE2PA(*pte);
+  } else {
+    if(!alloc || (pagetable = (pagetable_t)kalloc()) == 0)
+      return 0;
+    memset(pagetable, 0, PGSIZE);
+    *pte = PA2PTE(pagetable) | PTE_V;
+  }
+  return &pagetable[PX(1, va)];
+}
+#endif
+
 // add a mapping to the kernel page table.
 // only used when booting.
 // does not flush TLB or enable paging.
@@ -205,6 +236,23 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   a = va;
   last = va + size - PGSIZE;
   for(;;){
+#ifdef LAB_PGTBL
+    // megapage case: va, pa and the remaining range are all 2MB-friendly
+    if(a % SUPERPGSIZE == 0 && pa % SUPERPGSIZE == 0 &&
+       last + PGSIZE - a >= SUPERPGSIZE){
+      pte_t *pte1 = walkl1(pagetable, a, 1);
+      if(pte1 && (*pte1 & PTE_V) == 0){
+        *pte1 = PA2PTE(pa) | perm | PTE_V;
+        if(a + SUPERPGSIZE - PGSIZE == last)
+          break;
+        a += SUPERPGSIZE;
+        pa += SUPERPGSIZE;
+        continue;
+      }
+      // L1 slot already occupied (e.g. an empty L0 table left behind by a
+      // demote): fall through and map this 2MB as ordinary 4KB pages.
+    }
+#endif
     if((pte = walk(pagetable, a, 1)) == 0)
       return -1;
     if(*pte & PTE_V)
@@ -245,13 +293,26 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     panic("uvmunmap: not aligned");
 
   for(a = va; a < va + npages*PGSIZE; a += sz){
-    if((pte = walk(pagetable, a, 0)) == 0) // leaf page table entry allocated?
+    if((pte = walk(pagetable, a, 0)) == 0 || (*pte & PTE_V) == 0){
+      sz = PGSIZE;   // never carry a 2MB stride across a hole
       continue;
-    if((*pte & PTE_V) == 0)  // has physical page been allocated?
-      continue;
+    }
     sz = PGSIZE;
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
+#ifdef LAB_PGTBL
+    uint64 supa = PTE2PA(*pte);
+    if(is_super(supa)){
+      // whole-megapage removal only; partial frees are demoted by uvmdealloc
+      if(a % SUPERPGSIZE != 0 || a + SUPERPGSIZE > va + npages*PGSIZE)
+        panic("uvmunmap: partial superpage");
+      sz = SUPERPGSIZE;
+      if(do_free)
+        superfree((void*)supa);
+      *pte = 0;
+      continue;
+    }
+#endif
     if(do_free){
       uint64 pa = PTE2PA(*pte);
       kfree((void*)pa);
@@ -276,6 +337,21 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
   oldsz = PGROUNDUP(oldsz);
   for(a = oldsz; a < newsz; a += sz){
     sz = PGSIZE;
+#ifdef LAB_PGTBL
+    // aligned 2MB window fully inside the request: try one megapage
+    if(a % SUPERPGSIZE == 0 && a + SUPERPGSIZE <= newsz){
+      if((mem = superalloc()) != 0){
+        if(mappages(pagetable, a, SUPERPGSIZE, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
+          superfree(mem);
+          uvmdealloc(pagetable, a, oldsz);
+          return 0;
+        }
+        sz = SUPERPGSIZE;
+        continue;
+      }
+      // out of super chunks: fall through to ordinary pages
+    }
+#endif
     mem = kalloc();
     if(mem == 0){
       uvmdealloc(pagetable, a, oldsz);
@@ -297,6 +373,37 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
 // newsz.  oldsz and newsz need not be page-aligned, nor does newsz
 // need to be less than oldsz.  oldsz can be larger than the actual
 // process size.  Returns the new process size.
+#ifdef LAB_PGTBL
+// If va sits inside a live megapage, replace that 2MB leaf with 512
+// ordinary page mappings holding the same content (copy-demote), then
+// give the chunk back. Idempotent: on an already-demoted page the PTE
+// is an ordinary one (is_super false) and we do nothing.
+static void
+demote_if_super(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte = walk(pagetable, va, 0);
+  if(pte == 0 || (*pte & PTE_V) == 0)
+    return;
+  uint64 pa = PTE2PA(*pte);
+  if(!is_super(pa))
+    return;
+
+  uint64 base = va & ~(SUPERPGSIZE-1);
+  uint flags = PTE_FLAGS(*pte);
+
+  *pte = 0;                       // unplug the megapage leaf
+  for(uint64 k = 0; k < SUPERPGSIZE; k += PGSIZE){
+    char *mem = kalloc();
+    if(mem == 0)
+      panic("demote: kalloc");
+    memmove(mem, (char*)(pa + k), PGSIZE);
+    if(mappages(pagetable, base + k, PGSIZE, (uint64)mem, flags) != 0)
+      panic("demote: mappages");
+  }
+  superfree((void*)pa);
+}
+#endif
+
 uint64
 uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 {
@@ -304,6 +411,12 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
     return oldsz;
 
   if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
+#ifdef LAB_PGTBL
+    // demote any megapage that the freed range cuts into (both ends;
+    // if both ends land in the same megapage the second call is a no-op)
+    demote_if_super(pagetable, PGROUNDUP(newsz));
+    demote_if_super(pagetable, PGROUNDUP(oldsz) - PGSIZE);
+#endif
     int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
     uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
   }
@@ -358,14 +471,27 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   int szinc = PGSIZE;
 
   for(i = 0; i < sz; i += szinc){
-    if((pte = walk(old, i, 0)) == 0)
-      continue;
-    if((*pte & PTE_V) == 0) {
+    if((pte = walk(old, i, 0)) == 0 || (*pte & PTE_V) == 0){
+      szinc = PGSIZE;   // never carry a 2MB stride across a hole
       continue;
     }
     szinc = PGSIZE;
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
+#ifdef LAB_PGTBL
+    if(is_super(pa)){
+      // clone the whole megapage into a fresh chunk for the child
+      szinc = SUPERPGSIZE;
+      if((mem = superalloc()) == 0)
+        goto err;
+      memmove(mem, (char*)pa, SUPERPGSIZE);
+      if(mappages(new, i, SUPERPGSIZE, (uint64)mem, flags) != 0){
+        superfree(mem);
+        goto err;
+      }
+      continue;
+    }
+#endif
     if((mem = kalloc()) == 0)
       goto err;
     memmove(mem, (char*)pa, PGSIZE);

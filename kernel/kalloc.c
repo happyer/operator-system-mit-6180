@@ -23,11 +23,30 @@ struct {
   struct run *freelist;
 } kmem;
 
+#ifdef LAB_PGTBL
+// Superpage (2MB) allocator: a handful of physically contiguous,
+// 2MB-aligned chunks carved off the top of RAM at boot.
+#define NSUPER 20
+static struct {
+  struct spinlock lock;
+  uint64 base;            // start of reserved region (2MB-aligned)
+  int used[NSUPER];
+} supermem;
+#endif
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+#ifdef LAB_PGTBL
+  initlock(&supermem.lock, "supermem");
+  // reserve the top NSUPER 2MB chunks of RAM for superpages;
+  // PHYSTOP is 2MB-aligned, so supermem.base is too.
+  supermem.base = PHYSTOP - (uint64)NSUPER * SUPERPGSIZE;
+  freerange(end, (void*)supermem.base);
+#else
   freerange(end, (void*)PHYSTOP);
+#endif
 }
 
 void
@@ -50,6 +69,10 @@ kfree(void *pa)
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
+#ifdef LAB_PGTBL
+  if(is_super((uint64)pa))
+    panic("kfree: superpage chunk");   // must go back via superfree()
+#endif
 
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
@@ -80,3 +103,46 @@ kalloc(void)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
 }
+
+#ifdef LAB_PGTBL
+// Is pa inside the reserved superpage region?
+int
+is_super(uint64 pa)
+{
+  return pa >= supermem.base && pa < PHYSTOP;
+}
+
+// Allocate one zeroed 2MB-aligned chunk. Returns 0 if none free.
+void *
+superalloc(void)
+{
+  void *pa = 0;
+  acquire(&supermem.lock);
+  for(int i = 0; i < NSUPER; i++){
+    if(supermem.used[i] == 0){
+      supermem.used[i] = 1;
+      pa = (void*)(supermem.base + (uint64)i * SUPERPGSIZE);
+      break;
+    }
+  }
+  release(&supermem.lock);
+  if(pa)
+    memset(pa, 0, SUPERPGSIZE);
+  return pa;
+}
+
+// Return a chunk allocated by superalloc.
+void
+superfree(void *pa)
+{
+  uint64 a = (uint64)pa;
+  if(a < supermem.base || a >= PHYSTOP || (a % SUPERPGSIZE) != 0)
+    panic("superfree");
+  int i = (a - supermem.base) / SUPERPGSIZE;
+  acquire(&supermem.lock);
+  if(supermem.used[i] == 0)
+    panic("superfree: not in use");
+  supermem.used[i] = 0;
+  release(&supermem.lock);
+}
+#endif
