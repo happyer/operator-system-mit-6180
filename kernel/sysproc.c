@@ -106,3 +106,34 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_sigalarm(void)
+{
+  int interval;
+  uint64 handler;
+  struct proc *p = myproc();
+
+  argint(0, &interval);
+  argaddr(1, &handler);
+  p->alarm_interval = interval;
+  p->alarm_handler = handler;
+  p->alarm_ticks = 0;
+  p->alarm_handling = 0;
+  return 0;
+}
+
+uint64
+sys_sigreturn(void)
+{
+  struct proc *p = myproc();
+
+  if(p->alarm_handling){
+    *(p->trapframe) = p->alarm_tf;  // restore all 32 regs + epc + sp
+    p->alarm_handling = 0;
+    p->alarm_ticks = 0;             // re-arm the clock
+  }
+  // syscall() will overwrite trapframe->a0 with our return value;
+  // returning the backed-up a0 makes that write restore the original.
+  return p->alarm_tf.a0;
+}
