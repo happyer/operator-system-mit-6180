@@ -139,9 +139,27 @@ panic(char *s)
   panicking = 1;
   printf("panic: ");
   printf("%s\n", s);
+  backtrace();
   panicked = 1; // freeze uart output from other CPUs
   for(;;)
     ;
+}
+
+// Walk the chain of kernel stack frames (fp -> [fp-16]) and print each
+// saved return address ([fp-8]). Every frame lives on the single page
+// holding the current kernel stack, so stop once fp leaves that page
+// (the oldest frame's saved s0 is the *user* fp, which is off-page).
+void
+backtrace(void)
+{
+  uint64 fp = r_fp();
+  uint64 page = PGROUNDDOWN(fp);
+
+  printf("backtrace:\n");
+  while(fp != 0 && PGROUNDDOWN(fp) == page){
+    printf("%p\n", (void*)*(uint64 *)(fp - 8));
+    fp = *(uint64 *)(fp - 16);
+  }
 }
 
 void
