@@ -1,0 +1,59 @@
+Answers to the traps lab questions (RISC-V assembly, user/call.asm).
+All addresses below are from the actual call.asm built on this machine.
+
+Q1: Which registers contain arguments to functions? Which register holds
+    13 in main's call to printf?
+
+A1: Function arguments are passed in a0-a7 (up to 8; extra arguments go
+on the stack). Return values come back in a0.
+In main's call printf("%d %d\n", f(8)+1, 13):
+    a0 = 0x8d0 (address of the format string "%d %d\n", built by
+         auipc a0,0x1 / addi a0,a0,-1888)
+    a1 = 12  (li a1,12 -- the value of f(8)+1)
+    a2 = 13  (li a2,13)
+So 13 is held in register a2 (it is the third argument: format, 12, 13).
+
+Q2: Where is the call to function f in the assembly code for main?
+    Where is the call to g?
+
+A2: There is NO call to f and NO call to g anywhere in main. The compiler
+inlined both functions and then constant-folded the whole computation at
+compile time: f(8)+1 = g(8)+1 = (8+3)+1 = 12, so main simply executes
+"li a1,12" and calls printf directly. The standalone bodies of <f> and
+<g> still exist in the binary (nothing else calls them), and <f>'s body
+itself shows g inlined into it (f contains "addiw a0,a0,3" directly,
+with no "jal g").
+
+Q3: At what address is the function printf located?
+
+A3: 0x724. Visible in main's call instruction: "jal 724 <printf>"
+(at address 0x38), and in the symbol table (user/call.sym).
+
+Q4: What value is in the register ra just after the jalr to printf
+    in main?
+
+A4: ra = 0x3c -- the address of the instruction immediately following the
+call. (In this build main calls printf with "jal 724 <printf>" at address
+0x38; like jalr with rd=x1, jal writes pc+4 of the call instruction into
+ra.) So when printf finishes and executes ret, control returns to 0x3c,
+which is "li a0,0" (setting up exit(0)).
+
+Q5: In printf("x=%d y=%d", 3), what is going to be printed after 'y='?
+    Why?
+
+A5: 'y=' will be followed by a GARBAGE value -- whatever bits happen to
+be left in register a2 at the moment of the call (the register that would
+hold a third argument). It is not a fixed value; it differs between runs,
+call sites, and compiler versions.
+
+Why: printf is a variadic function. It receives no information about how
+many arguments were actually passed; it walks the argument list purely by
+counting conversion specifiers in the format string. For "%d %d" it fetches
+two values from the argument slots (a1 for x, a2 for y in the register
+spill area that fprintf/vprintf set up via "sd a2,0(s0)" etc.). Since the
+caller only initialized a0 (format) and a1 (3), the second %d reads the
+stale contents of the a2 slot. This is the same class of bug as reading
+uninitialized memory: nothing faults, because the register/slot physically
+exists -- it merely holds someone else's leftovers. (In this lab's own
+call.asm, fprintf spills a2-a7 to the stack unconditionally, so vprintf
+always has "an" value to read -- just not a meaningful one.)
