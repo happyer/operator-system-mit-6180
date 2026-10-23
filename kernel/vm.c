@@ -8,6 +8,9 @@
 #include "proc.h"
 #include "fs.h"
 
+// COW helper, defined below (used by copyout before its definition).
+uint64 cowfault(pagetable_t, uint64);
+
 /*
  * the kernel's page table.
  */
@@ -299,7 +302,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -308,11 +310,19 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       continue;   // physical page hasn't been allocated
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    // COW: share the father's physical page instead of copying it.
+    // Only for real user pages (PTE_U): the stack guard page is V|R|W
+    // WITHOUT U (exec's uvmclear only strips U) -- it must stay a plain
+    // forbidden page, not a copy-on-write candidate.
+    if((flags & PTE_W) && (flags & PTE_U)){
+      *pte = (*pte & ~PTE_W) | PTE_COW;   // father: write-protect + tag
+      flags = (flags & ~PTE_W) | PTE_COW; // child gets the same
+    }
+    // Read-only pages (text) are shared too -- they MUST be counted,
+    // or the child's exit would recycle a page the father still runs from.
+    ref_incr((void*)pa);
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+      kfree((void*)pa);   // undo the ref_incr (kfree decrements)
       goto err;
     }
   }
@@ -358,6 +368,13 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     }
 
     pte = walk(pagetable, va0, 0);
+    // COW: the kernel writes user memory by physical address -- the CPU
+    // never faults for us here, so resolve a shared page by hand first.
+    if(*pte & PTE_COW){
+      if((pa0 = cowfault(pagetable, va0)) == 0)
+        return -1;
+      pte = walk(pagetable, va0, 0);
+    }
     // forbid copyout over read-only user text pages.
     if((*pte & PTE_W) == 0)
       return -1;
@@ -449,6 +466,45 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 // that was lazily allocated in sys_sbrk().
 // returns 0 if va is invalid or already mapped, or if
 // out of physical memory, and physical address if successful.
+extern struct spinlock cow_lock;  // defined in kalloc.c
+
+// COW: resolve a write to a shared page -- give the faulting process
+// its own private copy. Returns the (new) physical address to write to,
+// or 0 if out of memory (caller must kill the process).
+uint64
+cowfault(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 pa_old, pa_new;
+
+  acquire(&cow_lock);
+
+  pte = walk(pagetable, va, 0);
+  if(pte == 0 || (*pte & PTE_V) == 0){
+    release(&cow_lock);
+    return 0;
+  }
+  if((*pte & PTE_COW) == 0){
+    // Another CPU already copied this page while we waited for the
+    // lock (double-check): its PTE is now private and writeable.
+    pa_new = PTE2PA(*pte);
+    release(&cow_lock);
+    return pa_new;
+  }
+
+  pa_old = PTE2PA(*pte);
+  pa_new = (uint64)kalloc();          // fresh page, refcnt = 1
+  if(pa_new == 0){
+    release(&cow_lock);
+    return 0;                         // no memory -> kill
+  }
+  memmove((void*)pa_new, (void*)pa_old, PGSIZE);
+  kfree((void*)pa_old);               // drop OUR ref on the shared page
+  *pte = PA2PTE(pa_new) | ((PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW);
+  release(&cow_lock);
+  return pa_new;
+}
+
 uint64
 vmfault(pagetable_t pagetable, uint64 va, int read)
 {
@@ -458,6 +514,17 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   if (va >= p->sz)
     return 0;
   va = PGROUNDDOWN(va);
+  // COW: write fault on a shared page -> copy it now. Must be checked
+  // BEFORE ismapped(): a COW page IS mapped, ismapped would say "nothing
+  // to do" and the write would be retried forever.
+  pte_t *cowpte = walk(pagetable, va, 0);
+  if(cowpte && (*cowpte & PTE_V) && (*cowpte & PTE_COW)){
+    if(read)
+      return 0;                       // a READ fault on a COW page is bogus
+                                      // (R is always set; e.g. guard page
+                                      // without U) -> let usertrap kill us
+    return cowfault(pagetable, va);   // new pa; 0 -> usertrap kills us
+  }
   if(ismapped(pagetable, va)) {
     return 0;
   }

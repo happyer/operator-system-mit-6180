@@ -368,6 +368,12 @@ typedef uint64 *pagetable_t; // 512 PTEs
 
 #define PTE_FLAGS(pte) ((pte) & 0x3FF)
 
+// COW: software-reserved bit (RSW field, bit 8). Hardware ignores it.
+// Marks a page that was writeable but got write-protected by fork();
+// a write fault on it means "copy me", unlike a genuinely read-only
+// text page (no PTE_COW, write = bug = kill).
+#define PTE_COW (1L << 8)
+
 // extract the three 9-bit page table indices from a virtual address.
 #define PXMASK          0x1FF // 9 bits
 #define PXSHIFT(level)  (PGSHIFT+(9*(level)))

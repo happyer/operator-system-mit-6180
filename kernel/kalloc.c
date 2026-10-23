@@ -21,12 +21,22 @@ struct run {
 struct {
   struct spinlock lock;
   struct run *freelist;
+  // COW: number of user page-table references to each physical page,
+  // indexed by (pa - KERNBASE) / PGSIZE. uchar suffices: at most
+  // NPROC(64) processes can share one page.
+  uchar refcnt[(PHYSTOP - KERNBASE) / PGSIZE];
 } kmem;
+
+// Serializes COW fault copying: two CPUs may fault on the same
+// shared page simultaneously (forkfork test hunts exactly this race).
+// Lock order: cow_lock -> kmem.lock (never the reverse).
+struct spinlock cow_lock;
 
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&cow_lock, "cow");
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -47,18 +57,38 @@ void
 kfree(void *pa)
 {
   struct run *r;
+  int idx = ((uint64)pa - KERNBASE) / PGSIZE;
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
-  memset(pa, 1, PGSIZE);
-
-  r = (struct run*)pa;
-
   acquire(&kmem.lock);
+  // Drop one reference. Note: freerange() at boot calls kfree on pages
+  // whose refcnt is 0 -- never decrement below zero (uchar would wrap
+  // to 255 and the page would look shared forever).
+  if(kmem.refcnt[idx] > 0)
+    kmem.refcnt[idx]--;
+  if(kmem.refcnt[idx] > 0){
+    // Other page tables still map this page: just detach, don't recycle.
+    release(&kmem.lock);
+    return;
+  }
+  // Fill with junk to catch dangling refs -- only when truly recycled
+  // (doing this earlier would scribble on a page someone still uses).
+  memset(pa, 1, PGSIZE);
+  r = (struct run*)pa;
   r->next = kmem.freelist;
   kmem.freelist = r;
+  release(&kmem.lock);
+}
+
+// COW: one more page table now maps this physical page.
+void
+ref_incr(void *pa)
+{
+  int idx = ((uint64)pa - KERNBASE) / PGSIZE;
+  acquire(&kmem.lock);
+  kmem.refcnt[idx]++;
   release(&kmem.lock);
 }
 
@@ -72,8 +102,10 @@ kalloc(void)
 
   acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r){
     kmem.freelist = r->next;
+    kmem.refcnt[((uint64)r - KERNBASE) / PGSIZE] = 1;  // fresh page: one user
+  }
   release(&kmem.lock);
 
   if(r)
