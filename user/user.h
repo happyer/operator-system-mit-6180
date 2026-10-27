@@ -44,6 +44,7 @@ char* sbrklazy(int);
 void fprintf(int, const char*, ...) __attribute__ ((format (printf, 2, 3)));
 void printf(const char*, ...) __attribute__ ((format (printf, 1, 2)));
 
+int symlink(const char *target, const char *path);
 // umalloc.c
 void* malloc(uint);
 void free(void*);
