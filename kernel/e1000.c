@@ -9,6 +9,7 @@
 
 #define TX_RING_SIZE 16
 static struct tx_desc tx_ring[TX_RING_SIZE] __attribute__((aligned(16)));
+static char *tx_bufs[TX_RING_SIZE];
 
 #define RX_RING_SIZE 16
 static struct rx_desc rx_ring[RX_RING_SIZE] __attribute__((aligned(16)));
@@ -93,33 +94,60 @@ e1000_init(uint32 *xregs)
 int
 e1000_transmit(char *buf, int len)
 {
-  //
-  // Your code here.
-  //
-  // buf contains an ethernet frame; program it into
-  // the TX descriptor ring so that the e1000 sends it. Stash
-  // a pointer so that it can be freed after send completes.
-  //
-  // return 0 on success.
-  // return -1 on failure (e.g., there is no descriptor available)
-  // so that the caller knows to free buf.
-  //
-
-  
+  acquire(&e1000_lock);
+  int tail = regs[E1000_TDT];
+  if((tx_ring[tail].status & E1000_TXD_STAT_DD) == 0){
+    release(&e1000_lock);
+    return -1;
+  }
+  __sync_synchronize();
+  // The device has finished reading the previous buffer in this slot.
+  if(tx_bufs[tail])
+    kfree(tx_bufs[tail]);
+  tx_bufs[tail] = buf;
+  tx_ring[tail].addr = (uint64)buf;
+  tx_ring[tail].length = len;
+  tx_ring[tail].cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
+  tx_ring[tail].status = 0;
+  // Publish the complete descriptor before advancing the device's tail.
+  __sync_synchronize();
+  regs[E1000_TDT] = (tail + 1) % TX_RING_SIZE;
+  release(&e1000_lock);
   return 0;
 }
 
 static void
 e1000_recv(void)
 {
-  //
-  // Your code here.
-  //
-  // Check for packets that have arrived from the e1000
-  // Create and deliver a buf for each packet (using net_rx()).
-  //
+  for(;;){
+    acquire(&e1000_lock);
+    int idx = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+    if((rx_ring[idx].status & E1000_RXD_STAT_DD) == 0){
+      release(&e1000_lock);
+      break;
+    }
+    __sync_synchronize();
+    char *buf = (char *)rx_ring[idx].addr;
+    int len = rx_ring[idx].length;
+    int valid = (rx_ring[idx].status & E1000_RXD_STAT_EOP) &&
+                rx_ring[idx].errors == 0 && len > 0 && len <= 2048;
+    char *replacement = kalloc();
+    if(replacement)
+      rx_ring[idx].addr = (uint64)replacement;
+    rx_ring[idx].status = 0;
+    __sync_synchronize();
+    regs[E1000_RDT] = idx;
+    release(&e1000_lock);
 
-}
+    // Without a replacement, recycle the same page and drop the packet.
+    // net_rx may send an ARP reply, so never call it with e1000_lock held.
+    if(replacement){
+      if(valid)
+        net_rx(buf, len);
+      else
+        kfree(buf);
+    }
+  }}
 
 void
 e1000_intr(void)
