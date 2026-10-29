@@ -79,6 +79,26 @@ make grade
 
 **2026-10-29：九个 Lab 全部完成，累计 983/983 分（各分支历史验收记录合计）。**
 
+### GitHub 资料与代码备份
+
+同一个远端仓库：`git@github.com:happyer/operator-system-mit-6180.git`。
+
+- `main`：本目录的 Markdown 笔记、教材 PDF、环境脚本。
+- `util` / `syscall` / `pgtbl` / `traps` / `cow` / `lock` / `fs` / `mmap` / `net`：对应实验的完整 xv6 源码与提交历史。
+- 资料与源码位于不同分支、目录布局不同。建议将代码单独克隆到 `xv6-labs-2025`，不要直接在本资料目录切换实验分支。
+- 本地内层仓库保留 MIT 官方远端 `origin`，备份远端名为 `github`。
+
+获取代码（选择 `net` 作为初始分支，其他实验可通过 `git switch` 切换）：
+
+```bash
+git clone --branch net git@github.com:happyer/operator-system-mit-6180.git xv6-labs-2025
+cd xv6-labs-2025
+git switch cow
+```
+
+大型工具链、构建产物及本地备份文件不上传。
+
+
 切换 Lab：
 
 ```bash
