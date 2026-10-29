@@ -1,0 +1,10 @@
+.DS_Store
+.codeflicker/
+*.bak
+
+# The xv6 lab branches are maintained in a separate repository.
+/xv6-labs-2025/
+
+# Keep reproducible scripts, not toolchains, virtualenvs or build outputs.
+/tools/*
+!/tools/*.sh
