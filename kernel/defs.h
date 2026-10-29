@@ -36,6 +36,10 @@ int             kexec(char*, char**);
 struct file*    filealloc(void);
 void            fileclose(struct file*);
 struct file*    filedup(struct file*);
+#ifdef LAB_MMAP
+void            exit_mmap(struct proc*);
+void            discard_mmap(struct proc*);
+#endif
 void            fileinit(void);
 int             fileread(struct file*, uint64, int n);
 int             filestat(struct file*, uint64 addr);

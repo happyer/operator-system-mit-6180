@@ -6,7 +6,10 @@
 #include "defs.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "fcntl.h"
 #include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
 
 /*
  * the kernel's page table.
@@ -455,21 +458,59 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   uint64 mem;
   struct proc *p = myproc();
 
-  if (va >= p->sz)
-    return 0;
   va = PGROUNDDOWN(va);
-  if(ismapped(pagetable, va)) {
-    return 0;
+  if (va < p->sz) {
+    // lazily-allocated sbrk page
+    if(ismapped(pagetable, va)) {
+      return 0;
+    }
+    mem = (uint64) kalloc();
+    if(mem == 0)
+      return 0;
+    memset((void *) mem, 0, PGSIZE);
+    if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
+      kfree((void *)mem);
+      return 0;
+    }
+    return mem;
   }
+#ifdef LAB_MMAP
+  // mmap'd file region: supply the page from the file, lazily.
+  // (trap.c passes read=1 for load faults, read=0 for store faults)
+  struct vma *v = 0;
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used && va >= p->vmas[i].start && va < p->vmas[i].end){
+      v = &p->vmas[i];
+      break;
+    }
+  }
+  if(v == 0)
+    return 0;                              // not ours: let trap.c kill the process
+  if(read && !(v->prot & PROT_READ))
+    return 0;
+  if(!read && !(v->prot & PROT_WRITE))
+    return 0;
+  if(ismapped(pagetable, va))
+    return 0;
   mem = (uint64) kalloc();
   if(mem == 0)
     return 0;
-  memset((void *) mem, 0, PGSIZE);
-  if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
+  memset((void *) mem, 0, PGSIZE);         // bytes past EOF stay zero
+  ilock(v->f->ip);
+  readi(v->f->ip, 0, mem, v->offset + (va - v->start), PGSIZE);
+  iunlock(v->f->ip);
+  int perm = PTE_U;
+  if(v->prot & PROT_READ)
+    perm |= PTE_R;
+  if(v->prot & PROT_WRITE)
+    perm |= PTE_W;
+  if(mappages(p->pagetable, va, PGSIZE, mem, perm) != 0){
     kfree((void *)mem);
     return 0;
   }
   return mem;
+#endif
+  return 0;
 }
 
 int

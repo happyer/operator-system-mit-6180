@@ -142,6 +142,9 @@ found:
 
   // Set up new context to start executing at forkret,
   // which returns to user space.
+#ifdef LAB_MMAP
+  memset(p->vmas, 0, sizeof(p->vmas));
+#endif
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
@@ -164,6 +167,9 @@ freeproc(struct proc *p)
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
+#ifdef LAB_MMAP
+  memset(p->vmas, 0, sizeof(p->vmas));
+#endif
   p->name[0] = 0;
   p->chan = 0;
   p->killed = 0;
@@ -272,6 +278,15 @@ kfork(void)
     return -1;
   }
   np->sz = p->sz;
+#ifdef LAB_MMAP
+  // child inherits file mappings (each with its own file reference)
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used){
+      np->vmas[i] = p->vmas[i];
+      np->vmas[i].f = filedup(p->vmas[i].f);
+    }
+  }
+#endif
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -336,6 +351,11 @@ kexit(int status)
       p->ofile[fd] = 0;
     }
   }
+
+#ifdef LAB_MMAP
+  // write back dirty shared pages and release all file mappings
+  exit_mmap(p);
+#endif
 
   begin_op();
   iput(p->cwd);

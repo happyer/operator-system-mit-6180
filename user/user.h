@@ -67,6 +67,8 @@ int statistics(void*, int);
 void fprintf(int, const char*, ...) __attribute__ ((format (printf, 2, 3)));
 void printf(const char*, ...) __attribute__ ((format (printf, 1, 2)));
 
+void* mmap(void*, int, int, int, int, uint64);
+int munmap(void*, int);
 // umalloc.c
 void* malloc(uint);
 void free(void*);

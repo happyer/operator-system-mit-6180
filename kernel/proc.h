@@ -79,6 +79,20 @@ struct trapframe {
   /* 280 */ uint64 t6;
 };
 
+#ifdef LAB_MMAP
+#define NVMA 16
+// A memory-mapped file region.
+struct vma {
+  int used;
+  uint64 start;        // [start, end), page aligned
+  uint64 end;
+  int prot;            // PROT_READ / PROT_WRITE
+  int flags;           // MAP_SHARED / MAP_PRIVATE
+  struct file *f;      // filedup'd reference, keeps inode alive
+  uint64 offset;       // file offset of vma->start
+};
+#endif
+
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
 // Per-process state
@@ -104,4 +118,7 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+#ifdef LAB_MMAP
+  struct vma vmas[NVMA];       // mmap'd file regions
+#endif
 };

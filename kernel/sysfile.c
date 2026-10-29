@@ -10,6 +10,7 @@
 #include "param.h"
 #include "stat.h"
 #include "spinlock.h"
+#include "memlayout.h"
 #include "proc.h"
 #include "fs.h"
 #include "sleeplock.h"
@@ -503,3 +504,189 @@ sys_pipe(void)
   }
   return 0;
 }
+
+#ifdef LAB_MMAP
+// Find a free address region of length len, allocating downward from
+// just below the trapframe page. Returns 0 on failure.
+static uint64
+find_mmap_region(struct proc *p, uint64 len)
+{
+  uint64 top = TRAMPOLINE - PGSIZE;   // trapframe page lives at TRAMPOLINE-PGSIZE
+  for(;;){
+    if(len >= top)
+      return 0;
+    uint64 start = top - len;
+    if(start < p->sz + PGSIZE)
+      return 0;                       // would collide with the sbrk region
+    int clash = 0;
+    for(int i = 0; i < NVMA; i++){
+      struct vma *v = &p->vmas[i];
+      if(v->used && start < v->end && v->start < start + len){
+        clash = 1;
+        break;
+      }
+    }
+    if(!clash)
+      return start;
+    top = start;                      // keep scanning downward
+  }
+}
+
+uint64
+sys_mmap(void)
+{
+  uint64 addr, offset;
+  int len, prot, flags, fd;
+  struct file *f;
+  struct proc *p = myproc();
+
+  argaddr(0, &addr);
+  argint(1, &len);
+  argint(2, &prot);
+  argint(3, &flags);
+  if(argfd(4, &fd, &f) < 0)
+    return -1;
+  argaddr(5, &offset);
+  if(addr != 0 || len <= 0)
+    return -1;
+  if(f->type != FD_INODE)
+    return -1;
+  // cannot map a read-only-opened file as shared-writable
+  if((prot & PROT_WRITE) && (flags & MAP_SHARED) && !f->writable)
+    return -1;
+
+  len = PGROUNDUP(len);
+
+  int slot = -1;
+  for(int i = 0; i < NVMA; i++)
+    if(!p->vmas[i].used){ slot = i; break; }
+  if(slot < 0)
+    return -1;
+
+  uint64 region = find_mmap_region(p, len);
+  if(region == 0)
+    return -1;
+
+  struct vma *v = &p->vmas[slot];
+  v->used = 1;
+  v->start = region;
+  v->end = region + len;
+  v->prot = prot;
+  v->flags = flags;
+  v->f = filedup(f);   // keep the file (and inode) alive past close(fd)/unlink
+  v->offset = offset;
+  return region;       // nothing is read or mapped yet: pages arrive on fault
+}
+
+// Unmap one page of v: write it back if dirty+shared, then drop the mapping.
+static void
+munmap_page(struct proc *p, struct vma *v, uint64 va)
+{
+  pte_t *pte = walk(p->pagetable, va, 0);
+  if(pte == 0 || (*pte & PTE_V) == 0)
+    return;
+  if((v->flags & MAP_SHARED) && (v->prot & PROT_WRITE) && (*pte & PTE_D)){
+    uint64 pa = PTE2PA(*pte);
+    uint64 fileoff = v->offset + (va - v->start);
+    begin_op();
+    ilock(v->f->ip);
+    if(v->f->ip->size > fileoff){
+      uint n = PGSIZE;
+      if(v->f->ip->size < fileoff + PGSIZE)
+        n = v->f->ip->size - fileoff;   // never grow the file past EOF
+      writei(v->f->ip, 0, pa, fileoff, n);
+    }
+    iunlock(v->f->ip);
+    end_op();
+  }
+  uvmunmap(p->pagetable, va, 1, 1);
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  int len;
+  struct proc *p = myproc();
+
+  argaddr(0, &addr);
+  argint(1, &len);
+  addr = PGROUNDDOWN(addr);
+  if(len <= 0)
+    return -1;
+  len = PGROUNDUP(len);
+
+  struct vma *v = 0;
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used && addr >= p->vmas[i].start && addr < p->vmas[i].end){
+      v = &p->vmas[i];
+      break;
+    }
+  }
+  if(v == 0)
+    return -1;
+
+  uint64 end = addr + len;
+  if(end > v->end)
+    end = v->end;
+
+  // a middle-hole unmap splits the vma; reserve the spare slot up front
+  int split = (addr > v->start && end < v->end);
+  int slot = -1;
+  if(split){
+    for(int i = 0; i < NVMA; i++)
+      if(!p->vmas[i].used){ slot = i; break; }
+    if(slot < 0)
+      return -1;
+  }
+
+  for(uint64 va = addr; va < end; va += PGSIZE)
+    munmap_page(p, v, va);
+
+  if(addr == v->start && end == v->end){
+    fileclose(v->f);
+    v->used = 0;
+  } else if(addr == v->start){
+    v->offset += (end - v->start);
+    v->start = end;
+  } else if(end == v->end){
+    v->end = addr;
+  } else {
+    p->vmas[slot] = *v;
+    p->vmas[slot].start = end;
+    p->vmas[slot].offset += (end - v->start);
+    v->end = addr;
+  }
+  return 0;
+}
+
+// exit(): write back dirty shared pages and release every mapping.
+void
+exit_mmap(struct proc *p)
+{
+  for(int i = 0; i < NVMA; i++){
+    struct vma *v = &p->vmas[i];
+    if(!v->used)
+      continue;
+    for(uint64 va = v->start; va < v->end; va += PGSIZE)
+      munmap_page(p, v, va);
+    fileclose(v->f);
+    v->used = 0;
+  }
+}
+
+// exec(): drop every mapping (no write-back) and free the pages,
+// before the old page table is released.
+void
+discard_mmap(struct proc *p)
+{
+  for(int i = 0; i < NVMA; i++){
+    struct vma *v = &p->vmas[i];
+    if(!v->used)
+      continue;
+    uvmunmap(p->pagetable, v->start, (v->end - v->start) / PGSIZE, 1);
+    fileclose(v->f);
+    v->used = 0;
+  }
+}
+#endif
